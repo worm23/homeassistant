@@ -1,0 +1,254 @@
+# =============================================================================
+# TCL Google TV — Audio Output Switch (HDMI/ARC <-> Bluetooth) for Home Assistant
+# =============================================================================
+#
+# WHAT THIS DOES
+# --------------
+# Lets Home Assistant switch a TCL Google TV's audio output between HDMI ARC/eARC
+# (e.g. a soundbar/AVR) and a Bluetooth speaker, and OPTIONALLY follow the
+# Bluetooth speaker automatically: when the speaker connects, sound moves to it;
+# when it disconnects, sound falls back to HDMI/ARC.
+#
+# Tested on: TCL 65C8K (Google TV). The core mechanism is TCL-specific but the
+# same approach works on other TCL Google TV models — only the numeric values
+# and entity/MAC may differ (see "CUSTOMIZE" below).
+#
+#
+# HOW IT WORKS (the important discovery)
+# --------------------------------------
+# On these TVs the selected audio output is stored in an Android *settings*
+# variable:
+#
+#     global / tcl_device_out_type
+#
+# A ContentObserver inside the TV firmware watches this variable and re-routes
+# the audio automatically the moment it changes. So writing the value with a
+# single `settings put` performs the whole switch — no on-screen menu, no
+# simulated key presses, no HDMI-CEC juggling.
+#
+# Known values of tcl_device_out_type (found empirically via `settings get`):
+#     4  = Bluetooth
+#     16 = HDMI ARC / eARC
+#     (Internal Speaker and other outputs use other integers; read them with
+#      `adb shell settings get global tcl_device_out_type` while that output
+#      is selected in the TV's Quick Settings.)
+#
+# Why not just disconnect the Bluetooth device to force HDMI? Because Google TV
+# pins the Bluetooth sink as the "preferred device for strategy" — disconnecting
+# leaves audio muted/stuck instead of falling back. Changing tcl_device_out_type
+# is the only clean, deterministic lever.
+#
+# Bluetooth connection state is read from:
+#     dumpsys bluetooth_manager
+# which prints one summary line per A2DP device:
+#     <MAC> : <Name> : <vol> : true          -> connected
+#     <MAC> : <Name> : <vol> : NotConnected  -> disconnected
+# so `... | grep <MAC> | grep -c true` yields 1 (connected) or 0 (disconnected).
+#
+# NOTE: On this TV the audio output is INDEPENDENT of the Bluetooth connection —
+# the TV does NOT auto-switch to Bluetooth on connect nor back to HDMI on
+# disconnect. That is exactly why the automations below exist.
+#
+#
+# REQUIREMENTS
+# ------------
+# 1. Enable ADB / Network debugging on the TV
+#    (Settings > System > About > tap Build a few times to unlock Developer
+#     options, then enable "Network debugging" / "USB debugging").
+# 2. Add the "Android Debug Bridge" integration in Home Assistant
+#    (Settings > Devices & Services > Add Integration > Android Debug Bridge),
+#    host = your TV's IP, port 5555. Approve the ADB key prompt on the TV once.
+#    This provides the media_player entity and the `androidtv.adb_command`
+#    service used below. Command output is returned in the entity attribute
+#    `adb_response`, which we read back to get live values.
+#
+#
+# INSTALL
+# -------
+# Recommended: Home Assistant "packages" so everything stays in one file and
+# merges cleanly with any existing `template:` / `script:` / `automation:`.
+#   1. In configuration.yaml:
+#        homeassistant:
+#          packages: !include_dir_named packages
+#   2. Put this file in  <config>/packages/tv_audio_output.yaml
+#   3. Developer Tools > YAML > Check Configuration, then RESTART Home Assistant
+#      (packages are only loaded at startup; a reload is not enough).
+#
+#
+# CUSTOMIZE (change these to match your setup)
+# --------------------------------------------
+#   - TV entity id:  media_player.wohnzimmer_tcl_android_tv_172_30_20_101
+#   - Bluetooth MAC: 50:5E:5C:90:FB:2C   (the speaker you want to follow)
+#   - Output values: 16 = HDMI ARC/eARC, 4 = Bluetooth (verify on your model)
+#   - Poll interval: `seconds: "/10"` in the poll automation (lower = faster
+#     reaction, more ADB traffic).
+# Tip: use Find & Replace across this file for the entity id and MAC.
+#
+#
+# WHAT YOU GET (entities created)
+# -------------------------------
+#   switch.tv_ton_bluetooth          -> on = Bluetooth, off = HDMI/ARC
+#   sensor.tv_audio_output           -> live output ("Bluetooth" / "HDMI ARC/eARC")
+#   binary_sensor.tv_wonderboom_verbunden -> live Bluetooth speaker connection
+#
+# BEHAVIOR NOTE: the auto-switch automations are TRANSITION-based (they fire only
+# when the speaker connects or disconnects), so a manual change you make in
+# between is preserved until the next connect/disconnect event.
+# =============================================================================
+
+
+# --------------------------------------------------------------
+# Raw values read back from the TV (filled by the poll / after switching).
+# These hold the unparsed ADB output; the template entities below interpret them.
+# --------------------------------------------------------------
+input_text:
+  tv_audio_output_raw:      # current tcl_device_out_type, e.g. "4" or "16"
+    name: TV Audio Output (raw)
+    max: 8
+  tv_wonderboom_raw:        # Bluetooth speaker connection count: "0" or "1"
+    name: TV WONDERBOOM connected (raw)
+    max: 8
+
+template:
+  - sensor:
+      # Human-readable current audio output, derived from tv_audio_output_raw.
+      - name: TV Audio Output
+        unique_id: tv_audio_output
+        icon: >
+          {% set v = states('input_text.tv_audio_output_raw') %}
+          {% if v == '4' %}mdi:bluetooth-audio
+          {% elif v == '16' %}mdi:hdmi-port
+          {% else %}mdi:speaker{% endif %}
+        state: >
+          {% set v = states('input_text.tv_audio_output_raw') %}
+          {% if v == '4' %}Bluetooth
+          {% elif v == '16' %}HDMI ARC/eARC
+          {% elif v in ['unknown','unavailable',''] %}unknown
+          {% else %}Other ({{ v }}){% endif %}
+
+  - binary_sensor:
+      # True while the Bluetooth speaker (by MAC) is connected to the TV.
+      # 'availability' keeps it "unavailable" until we have a real reading, so the
+      # connect/disconnect automations never fire on a startup/unknown transition.
+      #
+      # NOTE: this 'name' determines the entity_id on a fresh install
+      # (-> binary_sensor.tv_wonderboom_verbunden). The two automations below
+      # reference exactly that entity_id, so if you rename this, update them too.
+      - name: TV WONDERBOOM verbunden
+        unique_id: tv_wonderboom_connected
+        device_class: connectivity
+        availability: "{{ states('input_text.tv_wonderboom_raw') not in ['unknown','unavailable',''] }}"
+        state: "{{ states('input_text.tv_wonderboom_raw') | int(0) > 0 }}"
+
+  - switch:
+      # Dashboard one-tap control: on = Bluetooth, off = HDMI/ARC.
+      # State reflects the REAL value read back from the TV (not optimistic).
+      - name: TV Ton Bluetooth
+        unique_id: tv_audio_bluetooth
+        icon: mdi:bluetooth-audio
+        state: "{{ states('input_text.tv_audio_output_raw') == '4' }}"
+        turn_on:
+          - action: script.tv_audio_to_bluetooth
+        turn_off:
+          - action: script.tv_audio_to_hdmi
+
+
+# --------------------------------------------------------------
+# Scripts
+# --------------------------------------------------------------
+script:
+  # Force audio output to HDMI ARC/eARC (tcl_device_out_type = 16).
+  tv_audio_to_hdmi:
+    alias: TV audio -> HDMI/ARC
+    icon: mdi:hdmi-port
+    sequence:
+      - action: androidtv.adb_command
+        target: {entity_id: media_player.wohnzimmer_tcl_android_tv_172_30_20_101}
+        data: {command: "settings put global tcl_device_out_type 16"}
+      - action: script.tv_audio_refresh   # read the value straight back
+    mode: single
+
+  # Force audio output to the Bluetooth speaker (tcl_device_out_type = 4).
+  tv_audio_to_bluetooth:
+    alias: TV audio -> Bluetooth
+    icon: mdi:bluetooth-audio
+    sequence:
+      - action: androidtv.adb_command
+        target: {entity_id: media_player.wohnzimmer_tcl_android_tv_172_30_20_101}
+        data: {command: "settings put global tcl_device_out_type 4"}
+      - action: script.tv_audio_refresh
+    mode: single
+
+  # Read current audio output + Bluetooth connection state from the TV and store
+  # them in the input_text helpers. Two ADB calls; after each we wait ~1s and
+  # copy the media_player's `adb_response` attribute (where androidtv puts the
+  # command output) into the matching helper.
+  tv_audio_refresh:
+    alias: TV audio status refresh
+    sequence:
+      # 1) current audio output value
+      - action: androidtv.adb_command
+        target: {entity_id: media_player.wohnzimmer_tcl_android_tv_172_30_20_101}
+        data: {command: "settings get global tcl_device_out_type"}
+      - delay: "00:00:01"
+      - action: input_text.set_value
+        target: {entity_id: input_text.tv_audio_output_raw}
+        data:
+          value: "{{ (state_attr('media_player.wohnzimmer_tcl_android_tv_172_30_20_101','adb_response') or '') | trim }}"
+      # 2) Bluetooth speaker connection state (1 = connected, 0 = disconnected)
+      - action: androidtv.adb_command
+        target: {entity_id: media_player.wohnzimmer_tcl_android_tv_172_30_20_101}
+        data: {command: "dumpsys bluetooth_manager | grep 50:5E:5C:90:FB:2C | grep -c true"}
+      - delay: "00:00:01"
+      - action: input_text.set_value
+        target: {entity_id: input_text.tv_wonderboom_raw}
+        data:
+          value: "{{ (state_attr('media_player.wohnzimmer_tcl_android_tv_172_30_20_101','adb_response') or '') | trim }}"
+    mode: single
+
+
+# --------------------------------------------------------------
+# Automations
+# --------------------------------------------------------------
+automation:
+  # Poll the TV for output value + Bluetooth state on a fixed interval, but only
+  # while the TV is on (ADB fails when it's off). Lower the interval for faster
+  # auto-switching at the cost of more ADB traffic.
+  - alias: TV audio status poll
+    id: tv_audio_status_poll
+    trigger:
+      - platform: time_pattern
+        seconds: "/10"
+    condition:
+      - condition: not
+        conditions:
+          - condition: state
+            entity_id: media_player.wohnzimmer_tcl_android_tv_172_30_20_101
+            state: "off"
+    action:
+      - action: script.tv_audio_refresh
+    mode: single
+
+  # Bluetooth speaker just connected -> route audio to it.
+  - alias: TV audio - BT connected -> Bluetooth
+    id: tv_audio_bt_connected
+    trigger:
+      - platform: state
+        entity_id: binary_sensor.tv_wonderboom_verbunden
+        from: "off"
+        to: "on"
+    action:
+      - action: script.tv_audio_to_bluetooth
+    mode: single
+
+  # Bluetooth speaker just disconnected -> fall back to HDMI/ARC.
+  - alias: TV audio - BT disconnected -> HDMI
+    id: tv_audio_bt_disconnected
+    trigger:
+      - platform: state
+        entity_id: binary_sensor.tv_wonderboom_verbunden
+        from: "on"
+        to: "off"
+    action:
+      - action: script.tv_audio_to_hdmi
+    mode: single
